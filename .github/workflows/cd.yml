@@ -4,10 +4,14 @@ on:
   push:
     tags:
       - "v*.*.*"
+  schedule:
+    # Rebuild the latest release weekly so base image security fixes
+    # (Node.js, Alpine) reach users between releases.
+    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       version:
-        description: "Optional image version (e.g. 3.0.0, v3.0.0, or 3.0.0-beta.1)"
+        description: "Optional release to build (e.g. 3.0.0, v3.0.0, or 3.0.0-beta.1). Its tag is checked out."
         required: false
         default: ""
       include_latest:
@@ -15,6 +19,13 @@ on:
         required: false
         type: boolean
         default: true
+
+# One build at a time, so a scheduled rebuild can't overwrite tags while a
+# release is being published. Waiting runs queue up instead of replacing
+# each other.
+concurrency:
+  group: docker-images
+  queue: max
 
 jobs:
   build:
@@ -25,8 +36,6 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v5
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -50,19 +59,52 @@ jobs:
 
       - name: Compute version tags
         id: compute
+        env:
+          INPUT: ${{ github.event.inputs.version }}
+          INCLUDE_LATEST: ${{ github.event.inputs.include_latest }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          REPO_URL: https://github.com/${{ github.repository }}.git
         run: |
-          INPUT="${{ github.event.inputs.version }}"
-          REF_TYPE="${{ github.ref_type }}"
-          REF_NAME="${{ github.ref_name }}"
-          INCLUDE_LATEST="${{ github.event.inputs.include_latest }}"
-
           # Determine version source
           if [[ -n "$INPUT" ]]; then
             VERSION="${INPUT#v}"
           elif [[ "$REF_TYPE" == "tag" ]]; then
             VERSION="${REF_NAME#v}"
+          elif [[ "$EVENT_NAME" == "schedule" ]]; then
+            # Latest stable release
+            VERSION=$(git ls-remote --tags --refs "$REPO_URL" 'v*.*.*' \
+              | sed 's|.*refs/tags/v||' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+            if [[ -z "$VERSION" ]]; then
+              echo "::error::No release tag found to rebuild"
+              exit 1
+            fi
           else
             VERSION=""
+          fi
+
+          # Tag pushes and scheduled rebuilds always move the latest tags
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            INCLUDE_LATEST="true"
+          fi
+
+          if [[ ( -n "$INPUT" || -n "$VERSION" ) && ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version \"${INPUT:-$REF_NAME}\". Use a release version such as 3.0.0 or 3.0.0-beta.1."
+            exit 1
+          fi
+
+          # Build the release's own code, not whatever branch started the run.
+          # Tag pushes already point at the tagged commit.
+          if [[ -n "$VERSION" && "$EVENT_NAME" != "push" ]]; then
+            TAG_REFS=$(git ls-remote --tags "$REPO_URL" "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}")
+            # Annotated tags list the tag object and then the commit (^{})
+            SHA=$(echo "$TAG_REFS" | tail -n 1 | cut -f 1)
+            if [[ -z "$SHA" ]]; then
+              echo "::error::Tag v$VERSION not found. Push the tag before building version $VERSION."
+              exit 1
+            fi
           fi
 
           GHCR_TAGS=""
@@ -81,16 +123,16 @@ jobs:
               GHCR_TAGS="ghcr.io/${{ github.repository }}:$VERSION"
               GHCR_TAGS="$GHCR_TAGS,ghcr.io/${{ github.repository }}:${MAJOR}.${MINOR}"
               GHCR_TAGS="$GHCR_TAGS,ghcr.io/${{ github.repository }}:${MAJOR}"
-              GHCR_TAGS="$GHCR_TAGS,ghcr.io/${{ github.repository }}:postgresql-latest"
           
               DOCKER_TAGS="umamisoftware/umami:$VERSION"
               DOCKER_TAGS="$DOCKER_TAGS,umamisoftware/umami:${MAJOR}.${MINOR}"
               DOCKER_TAGS="$DOCKER_TAGS,umamisoftware/umami:${MAJOR}"
-              DOCKER_TAGS="$DOCKER_TAGS,umamisoftware/umami:postgresql-latest"
           
-              # Add latest tag based on trigger and input
-              if [[ "$REF_TYPE" == "tag" ]] || [[ "$INCLUDE_LATEST" == "true" ]]; then
+              # Add latest tags based on trigger and input
+              if [[ "$INCLUDE_LATEST" == "true" ]]; then
+                GHCR_TAGS="$GHCR_TAGS,ghcr.io/${{ github.repository }}:postgresql-latest"
                 GHCR_TAGS="$GHCR_TAGS,ghcr.io/${{ github.repository }}:latest"
+                DOCKER_TAGS="$DOCKER_TAGS,umamisoftware/umami:postgresql-latest"
                 DOCKER_TAGS="$DOCKER_TAGS,umamisoftware/umami:latest"
               fi
             fi
@@ -100,16 +142,27 @@ jobs:
             DOCKER_TAGS="umamisoftware/umami:${REF_NAME}"
           fi
 
-          echo "ghcr_tags=$GHCR_TAGS" >> $GITHUB_OUTPUT
-          echo "docker_tags=$DOCKER_TAGS" >> $GITHUB_OUTPUT
+          {
+            echo "sha=$SHA"
+            echo "ghcr_tags=$GHCR_TAGS"
+            echo "docker_tags=$DOCKER_TAGS"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${VERSION:+v$VERSION at }$SHA"
           echo "Computed GHCR tags: $GHCR_TAGS"
           echo "Computed Docker Hub tags: $DOCKER_TAGS"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.compute.outputs.sha }}
 
       - name: Build and push to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          pull: true
+          # Weekly rebuilds also refresh the OS packages installed on top of the base image
+          no-cache: ${{ github.event_name == 'schedule' }}
           push: true
           tags: ${{ steps.compute.outputs.ghcr_tags }}
           cache-from: type=gha
@@ -121,6 +174,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          pull: true
           push: true
           tags: ${{ steps.compute.outputs.docker_tags }}
           cache-from: type=gha
