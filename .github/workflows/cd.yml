@@ -7,7 +7,7 @@ on:
   schedule:
     # Rebuild the latest release weekly so base image security fixes
     # (Node.js, Alpine) reach users between releases.
-    - cron: "0 6 * * 1"
+    - cron: "32 19 * * *"
   workflow_dispatch:
     inputs:
       version:
@@ -30,7 +30,7 @@ concurrency:
 jobs:
   build:
     name: Build, push, and deploy
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
